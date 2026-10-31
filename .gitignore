@@ -1,0 +1,13 @@
+# Ignore virtual environments
+venv/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore Data (Crucial!)
+data/raw/*
+data/processed/*
+
+# Keep Jupyter checkpoints out
+.ipynb_checkpoints/
