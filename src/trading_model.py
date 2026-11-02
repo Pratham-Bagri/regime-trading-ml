@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import TimeSeriesSplit
 import config
@@ -10,11 +10,9 @@ def train_classifier():
     df = pd.read_csv(config.PROCESSED_DATA_PATH, index_col='Date', parse_dates=True)
     
     # 1. Define the Binary Target
-    # If tomorrow's return is > 0, Buy (1). Else, Sell (0).
     df['Signal'] = np.where(df['target_return'] > 0, 1, 0)
     
     # 2. One-Hot Encode the Regime
-    # Regimes 0, 1, 2 are independent categories, not ordinal magnitudes.
     regime_dummies = pd.get_dummies(df['Regime'], prefix='Regime')
     df = pd.concat([df, regime_dummies], axis=1)
     
@@ -26,31 +24,29 @@ def train_classifier():
     X = df[feature_cols].values
     y = df['Signal'].values
     
-    print(f"Executing Walk-Forward Validation on {len(df)} trading days...")
+    print(f"Executing Walk-Forward Validation with SVM on {len(df)} trading days...")
     
-    # 4. Walk-Forward Validation (Time Series Split)
-    # n_splits=5 slices the timeline into 5 chronological testing windows
+    # 4. Walk-Forward Validation
     tscv = TimeSeriesSplit(n_splits=5)
     precisions = []
     recalls = []
     
     for train_index, test_index in tscv.split(X):
-        # Strictly split past data (train) from future data (test)
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
         
-        # 5. Fit the Logistic Regression (Sigmoid Mapping)
-        model = LogisticRegression(random_state=42, max_iter=1000)
+        # 5. Fit the Support Vector Machine
+        # kernel='rbf' gives us the non-linear, curved decision boundaries
+        # C=1.0 is the regularization parameter (controls overfitting vs underfitting)
+        model = SVC(kernel='rbf', C=1.0, random_state=42)
         model.fit(X_train, y_train)
         
-        # Predict tomorrow's signal based solely on today's trained knowledge
         y_pred = model.predict(X_test)
         
-        # 6. Evaluate using strictly quantitative finance metrics
         precisions.append(precision_score(y_test, y_pred, zero_division=0))
         recalls.append(recall_score(y_test, y_pred, zero_division=0))
         
-    print("\n--- Walk-Forward Validation Results ---")
+    print("\n--- Walk-Forward Validation Results (SVM) ---")
     print(f"Average Precision: {np.mean(precisions):.4f}")
     print(f"Average Recall:    {np.mean(recalls):.4f}")
 
