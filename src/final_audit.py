@@ -5,123 +5,187 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-import config
+import warnings
 from trading_model import CausalFilteredHMM, FeatureConcatenator
+import config
 
-def match_coverage(y_scores, target_coverage=0.64):
-    """Dynamically scales threshold to ensure exactly target_coverage % of days are traded."""
-    threshold = np.percentile(y_scores, 100 - (target_coverage * 100))
-    return (y_scores >= threshold).astype(int)
+warnings.filterwarnings('ignore')
 
-def block_bootstrap_paired(y_true, y_pred_A, y_pred_B, block_size=20, iterations=5000):
-    """Bootstraps the precision difference (A - B) on identical test days."""
+def exact_coverage(y_scores, num_buys):
+    """Forces exactly num_buys to be 1."""
+    preds = np.zeros_like(y_scores, dtype=int)
+    top_idx = np.argsort(y_scores)[-num_buys:]
+    preds[top_idx] = 1
+    return preds
+
+def paired_bootstrap_diff(y_true, pred_A, pred_B, block_size=20, iterations=5000):
     n = len(y_true)
     diffs = []
-    
     for _ in range(iterations):
-        indices = []
-        while len(indices) < n:
-            start = np.random.randint(0, n - block_size)
-            indices.extend(range(start, start + block_size))
-        indices = indices[:n]
+        idx = []
+        while len(idx) < n:
+            start = np.random.randint(0, max(1, n - block_size))
+            idx.extend(range(start, start + block_size))
+        idx = idx[:n]
         
-        boot_true = y_true[indices]
-        pred_A = y_pred_A[indices]
-        pred_B = y_pred_B[indices]
-        
-        # Avoid zero division if a bootstrap sample happens to have 0 predictions
-        if np.sum(pred_A) > 0 and np.sum(pred_B) > 0:
-            prec_A = np.sum((pred_A == 1) & (boot_true == 1)) / np.sum(pred_A)
-            prec_B = np.sum((pred_B == 1) & (boot_true == 1)) / np.sum(pred_B)
-            diffs.append(prec_A - prec_B)
-            
+        b_true = y_true[idx]
+        pA, pB = pred_A[idx], pred_B[idx]
+        if np.sum(pA) > 0 and np.sum(pB) > 0:
+            precA = np.sum((pA == 1) & (b_true == 1)) / np.sum(pA)
+            precB = np.sum((pB == 1) & (b_true == 1)) / np.sum(pB)
+            diffs.append(precA - precB)
     return np.percentile(diffs, [2.5, 97.5])
 
-def run_final_audit():
-    print("--- 1. DATE & ARITHMETIC AUDIT ---")
+def single_bootstrap_lift(y_true, preds, base_rate, block_size=20, iterations=5000):
+    n = len(y_true)
+    lifts = []
+    for _ in range(iterations):
+        idx = []
+        while len(idx) < n:
+            start = np.random.randint(0, max(1, n - block_size))
+            idx.extend(range(start, start + block_size))
+        idx = idx[:n]
+        b_true, b_pred = y_true[idx], preds[idx]
+        if np.sum(b_pred) > 0:
+            prec = np.sum((b_pred == 1) & (b_true == 1)) / np.sum(b_pred)
+            lifts.append((prec - base_rate) * 100)
+    return np.percentile(lifts, [2.5, 97.5])
+
+def economic_bootstrap(ret_model, ret_bench, block_size=20, iterations=5000):
+    n = len(ret_model)
+    ret_diffs, sharpe_diffs = [], []
+    for _ in range(iterations):
+        idx = []
+        while len(idx) < n:
+            start = np.random.randint(0, max(1, n - block_size))
+            idx.extend(range(start, start + block_size))
+        idx = idx[:n]
+        
+        rM, rB = ret_model[idx], ret_bench[idx]
+        
+        ann_M = (1 + np.prod(1 + rM) - 1) ** (252 / n) - 1
+        vol_M = np.std(rM) * np.sqrt(252)
+        sh_M = ann_M / vol_M if vol_M != 0 else 0
+        
+        ann_B = (1 + np.prod(1 + rB) - 1) ** (252 / n) - 1
+        vol_B = np.std(rB) * np.sqrt(252)
+        sh_B = ann_B / vol_B if vol_B != 0 else 0
+        
+        ret_diffs.append((ann_M - ann_B) * 100)
+        sharpe_diffs.append(sh_M - sh_B)
+        
+    return np.percentile(ret_diffs, [2.5, 97.5]), np.percentile(sharpe_diffs, [2.5, 97.5])
+
+def run_master_audit():
+    print("Loading and strictly normalizing features...")
     df = pd.read_csv(config.PROCESSED_DATA_PATH, index_col='Date', parse_dates=True).dropna()
+    
+    # Strictly normalize non-stationary features
+    if 'OBV' in df.columns: df['OBV'] = df['OBV'].pct_change()
+    if 'MACD' in df.columns: df['MACD'] = df['MACD'] / df['Close']
+    if 'ATR' in df.columns: df['ATR'] = df['ATR'] / df['Close']
+    df = df.dropna()
+    
     df['Signal'] = np.where(df['target_return'] > 0, 1, 0)
+    feature_cols = [c for c in df.columns if c not in ['target_return', 'Signal', 'Close', 'return']]
     
-    feature_cols = [col for col in df.columns if col not in ['target_return', 'Signal', 'Close', 'return']]
-    X, y = df[feature_cols].values, df['Signal'].values
-    
+    X, y, rets = df[feature_cols].values, df['Signal'].values, df['target_return'].values
     holdout_idx = int(len(X) * 0.8)
-    df_cv, df_holdout = df.iloc[:holdout_idx], df.iloc[holdout_idx:]
     X_cv, y_cv = X[:holdout_idx], y[:holdout_idx]
-    
-    print(f"Total Dataset: {df.index[0].date()} to {df.index[-1].date()} ({len(df)} days)")
-    print(f"CV Set: {df_cv.index[0].date()} to {df_cv.index[-1].date()} ({len(df_cv)} days)")
-    print(f"Holdout Set: {df_holdout.index[0].date()} to {df_holdout.index[-1].date()} ({len(df_holdout)} days)")
+    X_ho, y_ho, rets_ho = X[holdout_idx:], y[holdout_idx:], rets[holdout_idx:]
     
     cv_outer = TimeSeriesSplit(n_splits=5, gap=20)
-    test_days_total = sum(len(test) for _, test in cv_outer.split(X_cv))
-    print(f"Total Outer OOS Test Days: {test_days_total}")
+    cv_inner = TimeSeriesSplit(n_splits=3, gap=20)
     
-    print("\n--- 2. MATCHED COVERAGE (64%) EVALUATION ---")
-    base_rate = np.mean(y_cv)
-    print(f"Base Rate (Expected Chance Precision): {base_rate:.4f}\n")
+    models = {
+        "LR Raw": (Pipeline([('s', StandardScaler()), ('lr', LogisticRegression())]), {'lr__C': [0.1, 1, 10]}),
+        "SVM Raw": (Pipeline([('s', StandardScaler()), ('svm', SVC())]), {'svm__C': [0.1, 1, 10], 'svm__kernel': ['linear', 'rbf']}),
+        "RF Raw": (Pipeline([('s', StandardScaler()), ('rf', RandomForestClassifier(random_state=42))]), {'rf__max_depth': [3, 5], 'rf__n_estimators': [50, 100]}),
+        "GB Raw": (Pipeline([('s', StandardScaler()), ('gb', GradientBoostingClassifier(random_state=42))]), {'gb__max_depth': [3], 'gb__n_estimators': [50]}),
+        "LR Full": (Pipeline([('s', StandardScaler()), ('pca', PCA(n_components=4)), ('hmm', FeatureConcatenator(n_components=3)), ('lr', LogisticRegression())]), {'lr__C': [0.1, 1]}),
+        "SVM Full": (Pipeline([('s', StandardScaler()), ('pca', PCA(n_components=4)), ('hmm', FeatureConcatenator(n_components=3)), ('svm', SVC())]), {'svm__C': [0.1, 1], 'svm__kernel': ['linear', 'rbf']}),
+        "SVM PCA-Only": (Pipeline([('s', StandardScaler()), ('pca', PCA(n_components=4)), ('svm', SVC())]), {'svm__C': [0.1, 1], 'svm__kernel': ['linear', 'rbf']}),
+        "SVM HMM-Only": (Pipeline([('s', StandardScaler()), ('hmm', FeatureConcatenator(n_components=3)), ('svm', SVC())]), {'svm__C': [0.1, 1], 'svm__kernel': ['linear', 'rbf']})
+    }
     
-    lr_raw = Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression(random_state=42))])
-    svm_raw = Pipeline([('scaler', StandardScaler()), ('svm', SVC(random_state=42))])
+    predictions = {m: [] for m in models}
+    y_true_oos = []
+    rbf_count = 0
     
-    # We will use decision_function to match coverage manually
-    lr_scores_all, svm_scores_all, y_true_all = [], [], []
-    
+    print("Running Nested CV...")
     for train_idx, test_idx in cv_outer.split(X_cv):
-        X_train, X_test = X_cv[train_idx], X_cv[test_idx]
-        y_train, y_test = y_cv[train_idx], y_cv[test_idx]
+        X_tr, X_te = X_cv[train_idx], X_cv[test_idx]
+        y_tr, y_te = y_cv[train_idx], y_cv[test_idx]
+        y_true_oos.extend(y_te)
         
-        lr_raw.fit(X_train, y_train)
-        svm_raw.fit(X_train, y_train)
-        
-        lr_scores_all.extend(lr_raw.decision_function(X_test))
-        svm_scores_all.extend(svm_raw.decision_function(X_test))
-        y_true_all.extend(y_test)
-        
-    y_true_all = np.array(y_true_all)
-    lr_preds_matched = match_coverage(np.array(lr_scores_all), 0.64)
-    svm_preds_matched = match_coverage(np.array(svm_scores_all), 0.64)
+        for name, (pipe, grid) in models.items():
+            gs = GridSearchCV(pipe, grid, cv=cv_inner, scoring='precision', n_jobs=-1)
+            gs.fit(X_tr, y_tr)
+            predictions[name].extend(gs.decision_function(X_te) if hasattr(gs, 'decision_function') else gs.predict_proba(X_te)[:, 1])
+            
+            if name == "SVM Full" and gs.best_params_['svm__kernel'] == 'rbf':
+                rbf_count += 1
+                
+    y_true_oos = np.array(y_true_oos)
+    total_oos = len(y_true_oos)
+    base_rate = np.mean(y_true_oos)
+    target_buys = int(total_oos * 0.64)  # ~1277
+    print(f"\n--- OOS BASE RATE: {np.sum(y_true_oos)}/{total_oos} = {base_rate:.4%} ---")
+    print(f"SVM Full selected RBF in {rbf_count}/5 folds\n")
     
-    lr_prec = np.sum((lr_preds_matched == 1) & (y_true_all == 1)) / np.sum(lr_preds_matched)
-    svm_prec = np.sum((svm_preds_matched == 1) & (y_true_all == 1)) / np.sum(svm_preds_matched)
-    
-    print(f"LR (Raw)  -> Precision: {lr_prec:.4f} | Lift over Base: {(lr_prec - base_rate)*100:+.2f} pp")
-    print(f"SVM (Raw) -> Precision: {svm_prec:.4f} | Lift over Base: {(svm_prec - base_rate)*100:+.2f} pp")
-    
-    ci_diff = block_bootstrap_paired(y_true_all, svm_preds_matched, lr_preds_matched, iterations=5000)
-    print(f"Paired Block Bootstrap CI (SVM - LR) at 64% coverage: [{ci_diff[0]:.4f}, {ci_diff[1]:.4f}]")
+    print("--- 64% MATCHED COVERAGE (Exactly 1277 Buys) ---")
+    matched_preds = {}
+    for name, scores in predictions.items():
+        preds = exact_coverage(np.array(scores), target_buys)
+        matched_preds[name] = preds
+        tp = np.sum((preds == 1) & (y_true_oos == 1))
+        prec = tp / target_buys
+        lift = (prec - base_rate) * 100
+        ci = single_bootstrap_lift(y_true_oos, preds, base_rate)
+        print(f"{name:15} | TP: {tp}/1277 | Prec: {prec:.4f} | Lift: {lift:+.2f} pp | CI: [{ci[0]:+.2f}, {ci[1]:+.2f}]")
 
-    print("\n--- 3. HOLDOUT ECONOMIC BACKTEST ---")
-    returns_holdout = df_holdout['target_return'].values
-    trading_days = 252
-    
-    def calc_metrics(ret_array):
-        cum_ret = np.prod(1 + ret_array) - 1
-        ann_ret = (1 + cum_ret) ** (trading_days / len(ret_array)) - 1
-        vol = np.std(ret_array) * np.sqrt(trading_days)
-        sharpe = ann_ret / vol if vol != 0 else 0
-        return ann_ret, sharpe
+    print("\n--- PAIRED DIFFERENCES (95% CI) ---")
+    ci_full = paired_bootstrap_diff(y_true_oos, matched_preds["SVM Full"], matched_preds["LR Full"])
+    ci_raw = paired_bootstrap_diff(y_true_oos, matched_preds["SVM Raw"], matched_preds["LR Raw"])
+    print(f"SVM Full - LR Full: [{ci_full[0]:.4f}, {ci_full[1]:.4f}]")
+    print(f"SVM Raw  - LR Raw:  [{ci_raw[0]:.4f}, {ci_raw[1]:.4f}]")
+
+    print("\n--- HOLDOUT BACKTEST ---")
+    cost = 0.0005
+    for name in ["LR Full", "SVM Full"]:
+        pipe, grid = models[name]
+        gs = GridSearchCV(pipe, grid, cv=cv_inner, scoring='precision', n_jobs=-1)
+        gs.fit(X_cv, y_cv)
         
-    # Baseline 1: Buy and Hold (100% Exposure)
-    bnh_ann, bnh_sharpe = calc_metrics(returns_holdout)
-    
-    # Baseline 2: Constant 64% Exposure (Beta-adjusted B&H)
-    bnh_64_ann, bnh_64_sharpe = calc_metrics(returns_holdout * 0.64)
-    
-    # Baseline 3: Random Timing (1000 draws of 64% coverage)
-    np.random.seed(42)
-    rand_anns, rand_sharpes = [], []
-    for _ in range(1000):
-        rand_preds = np.random.binomial(1, 0.64, size=len(returns_holdout))
-        rand_ret = rand_preds * returns_holdout
-        a, s = calc_metrics(rand_ret)
-        rand_anns.append(a)
-        rand_sharpes.append(s)
+        cv_scores = gs.decision_function(X_cv) if hasattr(gs, 'decision_function') else gs.predict_proba(X_cv)[:, 1]
+        threshold = np.percentile(cv_scores, 100 - 64)
         
-    print(f"Buy & Hold (100%):     Return {bnh_ann:.2%} | Sharpe {bnh_sharpe:.2f}")
-    print(f"Buy & Hold ( 64%):     Return {bnh_64_ann:.2%} | Sharpe {bnh_64_sharpe:.2f}")
-    print(f"Random Timing (64%):   Return CI [{np.percentile(rand_anns, 2.5):.2%}, {np.percentile(rand_anns, 97.5):.2%}] | Sharpe CI [{np.percentile(rand_sharpes, 2.5):.2f}, {np.percentile(rand_sharpes, 97.5):.2f}]")
+        ho_scores = gs.decision_function(X_ho) if hasattr(gs, 'decision_function') else gs.predict_proba(X_ho)[:, 1]
+        ho_preds = (ho_scores >= threshold).astype(int)
+        
+        exposure = np.mean(ho_preds)
+        changes = np.abs(np.diff(np.insert(ho_preds, 0, 0)))
+        strat_ret = ho_preds * rets_ho - (changes * cost)
+        bench_ret = rets_ho * exposure
+        
+        ann_S = (1 + np.prod(1 + strat_ret) - 1) ** (252 / len(rets_ho)) - 1
+        vol_S = np.std(strat_ret) * np.sqrt(252)
+        sh_S = ann_S / vol_S
+        max_dd_S = np.min((np.cumprod(1 + strat_ret) - np.maximum.accumulate(np.cumprod(1 + strat_ret))) / np.maximum.accumulate(np.cumprod(1 + strat_ret)))
+        
+        ann_B = (1 + np.prod(1 + bench_ret) - 1) ** (252 / len(rets_ho)) - 1
+        vol_B = np.std(bench_ret) * np.sqrt(252)
+        sh_B = ann_B / vol_B
+        
+        ci_ret, ci_sh = economic_bootstrap(strat_ret, bench_ret)
+        
+        print(f"\n{name} Holdout (Threshold frozen from CV)")
+        print(f"Realized Exposure: {exposure:.2%} | Trades: {np.sum(changes)}")
+        print(f"Strategy -> Ret: {ann_S:.2%} | Vol: {vol_S:.2%} | Sharpe: {sh_S:.2f} | MaxDD: {max_dd_S:.2%}")
+        print(f"Bench({exposure:.0%}) -> Ret: {ann_B:.2%} | Vol: {vol_B:.2%} | Sharpe: {sh_B:.2f}")
+        print(f"Paired Diff CI -> Return: [{ci_ret[0]:.2f}, {ci_ret[1]:.2f}] pp | Sharpe: [{ci_sh[0]:.2f}, {ci_sh[1]:.2f}]")
 
 if __name__ == '__main__':
-    run_final_audit()
+    run_master_audit()

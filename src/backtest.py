@@ -2,84 +2,129 @@ import pandas as pd
 import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.model_selection import TimeSeriesSplit
+from trading_model import CausalFilteredHMM, FeatureConcatenator
 import config
+import warnings
 
-def run_financial_backtest():
-    print("Loading raw features for the final financial backtest...")
-    df = pd.read_csv(config.PROCESSED_DATA_PATH, index_col='Date', parse_dates=True)
+warnings.filterwarnings('ignore')
+
+def economic_bootstrap(ret_model, ret_bench, block_size=20, iterations=5000):
+    n = len(ret_model)
+    ret_diffs, sharpe_diffs = [], []
+    for _ in range(iterations):
+        idx = []
+        while len(idx) < n:
+            start = np.random.randint(0, max(1, n - block_size))
+            idx.extend(range(start, start + block_size))
+        idx = idx[:n]
+        
+        rM, rB = ret_model[idx], ret_bench[idx]
+        
+        ann_M = (1 + np.prod(1 + rM) - 1) ** (252 / n) - 1
+        vol_M = np.std(rM) * np.sqrt(252)
+        sh_M = ann_M / vol_M if vol_M != 0 else 0
+        
+        ann_B = (1 + np.prod(1 + rB) - 1) ** (252 / n) - 1
+        vol_B = np.std(rB) * np.sqrt(252)
+        sh_B = ann_B / vol_B if vol_B != 0 else 0
+        
+        ret_diffs.append((ann_M - ann_B) * 100)
+        sharpe_diffs.append(sh_M - sh_B)
+        
+    return np.percentile(ret_diffs, [2.5, 97.5]), np.percentile(sharpe_diffs, [2.5, 97.5])
+
+def run_full_causal_backtest():
+    print("Loading and strictly normalizing features (OBV, MACD, ATR)...")
+    df = pd.read_csv(config.PROCESSED_DATA_PATH, index_col='Date', parse_dates=True).dropna()
+    
+    if 'OBV' in df.columns: df['OBV'] = df['OBV'].pct_change()
+    if 'MACD' in df.columns: df['MACD'] = df['MACD'] / df['Close']
+    if 'ATR' in df.columns: df['ATR'] = df['ATR'] / df['Close']
     df = df.dropna()
     
     df['Signal'] = np.where(df['target_return'] > 0, 1, 0)
-    feature_cols = [col for col in df.columns if col not in ['target_return', 'Signal', 'Close', 'return']]
-    X = df[feature_cols].values
-    y = df['Signal'].values
-    returns = df['target_return'].values
+    feature_cols = [c for c in df.columns if c not in ['target_return', 'Signal', 'Close', 'return']]
     
-    # Isolate the untouched 20% holdout set
+    X, y, rets = df[feature_cols].values, df['Signal'].values, df['target_return'].values
     holdout_idx = int(len(X) * 0.8)
     X_cv, y_cv = X[:holdout_idx], y[:holdout_idx]
-    X_holdout, y_holdout = X[holdout_idx:], y[holdout_idx:]
-    returns_holdout = returns[holdout_idx:]
+    X_ho, y_ho, rets_ho = X[holdout_idx:], y[holdout_idx:], rets[holdout_idx:]
     
-    # Train final model on the entire cross-validation set
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('lr', LogisticRegression(C=0.1, random_state=42, max_iter=1000))
-    ])
-    pipeline.fit(X_cv, y_cv)
+    models = {
+        "LR Full": Pipeline([
+            ('s', StandardScaler()), 
+            ('pca', PCA(n_components=4)), 
+            ('hmm', FeatureConcatenator(n_components=3)), 
+            ('lr', LogisticRegression(C=1, max_iter=1000))
+        ]),
+        "SVM Full": Pipeline([
+            ('s', StandardScaler()), 
+            ('pca', PCA(n_components=4)), 
+            ('hmm', FeatureConcatenator(n_components=3)), 
+            ('svm', SVC(C=1, kernel='rbf', probability=True))
+        ])
+    }
     
-    # Generate predictions on the holdout set
-    # Using the 50% threshold to maximize market exposure for a fair comparison
-    predictions = pipeline.predict(X_holdout)
+    cv_inner = TimeSeriesSplit(n_splits=5, gap=20)
     
-    # Calculate Financial Metrics
-    trading_days = 252
-    transaction_cost = 0.0005  # 5 bps per trade
-    
-    # Strategy Returns: If we predict 1, we capture the next day's return. 
-    # If 0, we sit in cash (0 return).
-    strategy_returns = predictions * returns_holdout
-    
-    # Subtract transaction costs whenever our position changes
-    # Position changes: abs(pred_t - pred_{t-1})
-    position_changes = np.abs(np.diff(np.insert(predictions, 0, 0)))
-    strategy_returns_net = strategy_returns - (position_changes * transaction_cost)
-    
-    # Buy and Hold Baseline
-    bnh_returns = returns_holdout
-    
-    def calc_metrics(ret_array):
-        cum_ret = np.prod(1 + ret_array) - 1
-        ann_ret = (1 + cum_ret) ** (trading_days / len(ret_array)) - 1
-        vol = np.std(ret_array) * np.sqrt(trading_days)
-        sharpe = ann_ret / vol if vol != 0 else 0
+    for name, pipeline in models.items():
+        print(f"\n--- Processing {name} ---")
+        print("Generating pooled out-of-fold scores to seed causal threshold...")
+        oof_scores = []
+        for train_idx, test_idx in cv_inner.split(X_cv):
+            pipeline.fit(X_cv[train_idx], y_cv[train_idx])
+            scores = pipeline.predict_proba(X_cv[test_idx])[:, 1]
+            oof_scores.extend(scores)
+            
+        print("Refitting walk-forward through the holdout set (this may take a minute)...")
+        historical_scores = list(oof_scores)
+        predictions = []
         
-        # Max Drawdown
-        cum_index = np.cumprod(1 + ret_array)
-        running_max = np.maximum.accumulate(cum_index)
-        drawdown = (cum_index - running_max) / running_max
-        max_dd = np.min(drawdown)
+        refit_step = 20
+        for i in range(len(X_ho)):
+            if i % refit_step == 0:
+                X_train = np.vstack((X_cv, X_ho[:i])) if i > 0 else X_cv
+                y_train = np.concatenate((y_cv, y_ho[:i])) if i > 0 else y_cv
+                pipeline.fit(X_train, y_train)
+                
+            score = pipeline.predict_proba(X_ho[i:i+1])[:, 1][0]
+            
+            # Causal expanding quantile mapped to 64% coverage target
+            threshold = np.percentile(historical_scores, 100 - 64)
+            pred = int(score >= threshold)
+            
+            predictions.append(pred)
+            historical_scores.append(score)
+            
+        predictions = np.array(predictions)
+        in_market_days = np.sum(predictions)
+        exposure = in_market_days / len(rets_ho)
         
-        return ann_ret, vol, sharpe, max_dd
-
-    strat_ann, strat_vol, strat_sharpe, strat_dd = calc_metrics(strategy_returns_net)
-    bnh_ann, bnh_vol, bnh_sharpe, bnh_dd = calc_metrics(bnh_returns)
-    
-    print("\n--- Holdout Set Financial Backtest ---")
-    print(f"Trading Days: {len(returns_holdout)}")
-    print(f"Total Trades Executed: {np.sum(position_changes)}")
-    print("\nBuy and Hold Baseline:")
-    print(f"Annualized Return: {bnh_ann:.2%}")
-    print(f"Volatility: {bnh_vol:.2%}")
-    print(f"Sharpe Ratio: {bnh_sharpe:.2f}")
-    print(f"Max Drawdown: {bnh_dd:.2%}")
-    
-    print("\nLogistic Regression Strategy (Net of 5bps Costs):")
-    print(f"Annualized Return: {strat_ann:.2%}")
-    print(f"Volatility: {strat_vol:.2%}")
-    print(f"Sharpe Ratio: {strat_sharpe:.2f}")
-    print(f"Max Drawdown: {strat_dd:.2%}")
+        trades = np.sum(np.abs(np.diff(np.insert(predictions, 0, 0))))
+        strat_ret = predictions * rets_ho - (np.abs(np.diff(np.insert(predictions, 0, 0))) * 0.0005)
+        bench_ret = rets_ho * exposure
+        
+        ann_S = (1 + np.prod(1 + strat_ret) - 1) ** (252 / len(rets_ho)) - 1
+        vol_S = np.std(strat_ret) * np.sqrt(252)
+        sh_S = ann_S / vol_S if vol_S != 0 else 0
+        max_dd_S = np.min((np.cumprod(1 + strat_ret) - np.maximum.accumulate(np.cumprod(1 + strat_ret))) / np.maximum.accumulate(np.cumprod(1 + strat_ret)))
+        
+        ann_B = (1 + np.prod(1 + bench_ret) - 1) ** (252 / len(rets_ho)) - 1
+        vol_B = np.std(bench_ret) * np.sqrt(252)
+        sh_B = ann_B / vol_B if vol_B != 0 else 0
+        
+        print("Bootstrapping confidence intervals...")
+        ci_ret, ci_sh = economic_bootstrap(strat_ret, bench_ret)
+        
+        print(f"\n{name} Holdout Metrics:")
+        print(f"In-Market Days: {in_market_days}/600 | Realized Exposure: {exposure:.2%} | Trades: {trades}")
+        print(f"Strategy -> Ret: {ann_S:.2%} | Vol: {vol_S:.2%} | Sharpe: {sh_S:.2f} | MaxDD: {max_dd_S:.2%}")
+        print(f"Bench({exposure:.0%}) -> Ret: {ann_B:.2%} | Vol: {vol_B:.2%} | Sharpe: {sh_B:.2f}")
+        print(f"Paired Diff CI -> Return: [{ci_ret[0]:.2f}, {ci_ret[1]:.2f}] pp | Sharpe: [{ci_sh[0]:.2f}, {ci_sh[1]:.2f}]")
 
 if __name__ == '__main__':
-    run_financial_backtest()
+    run_full_causal_backtest()
